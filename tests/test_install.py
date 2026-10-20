@@ -25,7 +25,6 @@ class InstallTests(unittest.TestCase):
                 fake_bin.mkdir()
                 self._command(fake_bin / "gnome-shell", f"printf 'GNOME Shell {major}.0\\n'\n")
                 self._command(fake_bin / "gnome-extensions", "exit 0\n")
-                self._command(fake_bin / "xdotool", "exit 0\n")
                 env = os.environ.copy()
                 env.update({
                     "PATH": f"{fake_bin}:{env['PATH']}",

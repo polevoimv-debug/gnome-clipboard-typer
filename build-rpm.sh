@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly VERSION="1.0.2"
+readonly VERSION="1.0.3"
 readonly SOURCE_NAME="clipboard-typer-${VERSION}"
 readonly DIST_DIR="${SCRIPT_DIR}/dist"
 

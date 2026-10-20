@@ -12,20 +12,20 @@
 ## Установка готового RPM
 
 Готовые пакеты опубликованы в
-[GitHub Releases](https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/tag/v1.0.2).
+[GitHub Releases](https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/tag/v1.0.3).
 На РЕД ОС их можно скачать прямо из терминала:
 
 ```bash
 # GNOME Shell 44
-curl -LO https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/download/v1.0.2/gnome-shell-extension-clipboard-typer-gnome44-1.0.2-1.noarch.rpm
+curl -LO https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/download/v1.0.3/gnome-shell-extension-clipboard-typer-gnome44-1.0.3-1.noarch.rpm
 
 # GNOME Shell 45 или 46
-curl -LO https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/download/v1.0.2/gnome-shell-extension-clipboard-typer-gnome46-1.0.2-1.noarch.rpm
+curl -LO https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/download/v1.0.3/gnome-shell-extension-clipboard-typer-gnome46-1.0.3-1.noarch.rpm
 
 # GNOME Shell 47 или 48
-curl -LO https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/download/v1.0.2/gnome-shell-extension-clipboard-typer-gnome48-1.0.2-1.noarch.rpm
+curl -LO https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/download/v1.0.3/gnome-shell-extension-clipboard-typer-gnome48-1.0.3-1.noarch.rpm
 
-curl -LO https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/download/v1.0.2/SHA256SUMS
+curl -LO https://github.com/polevoimv-debug/gnome-clipboard-typer/releases/download/v1.0.3/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 ```
 
@@ -39,13 +39,13 @@ gnome-shell --version
 
 ```bash
 # GNOME Shell 44
-sudo -E dnf install ./dist/gnome-shell-extension-clipboard-typer-gnome44-1.0.2-1.noarch.rpm
+sudo -E dnf install ./dist/gnome-shell-extension-clipboard-typer-gnome44-1.0.3-1.noarch.rpm
 
 # GNOME Shell 45 или 46
-sudo -E dnf install ./dist/gnome-shell-extension-clipboard-typer-gnome46-1.0.2-1.noarch.rpm
+sudo -E dnf install ./dist/gnome-shell-extension-clipboard-typer-gnome46-1.0.3-1.noarch.rpm
 
 # GNOME Shell 47 или 48
-sudo -E dnf install ./dist/gnome-shell-extension-clipboard-typer-gnome48-1.0.2-1.noarch.rpm
+sudo -E dnf install ./dist/gnome-shell-extension-clipboard-typer-gnome48-1.0.3-1.noarch.rpm
 ```
 
 Пакеты локальной сборки не подписаны GPG. Если политика DNF требует подпись,
@@ -70,6 +70,26 @@ RPM устанавливает файлы системно, поэтому то�
 правами администратора. Само расширение и команда включения от root не
 запускаются.
 
+## Исправления 1.0.3
+
+Вместо `xdotool type` используется собственный ввод через X11 XTEST с учётом
+раскладок XKB. `xdotool` при раскладках `us,ru` терял переводы строк и для
+`;`, `?`, `/` и других знаков нажимал клавиши русской раскладки: веб-консоль
+виртуальной машины, которая передаёт физические клавиши, получала `$`, `&`, `|`.
+Теперь:
+
+* латиница, цифры и знаки препинания набираются клавишами латинской раскладки,
+  кириллица — клавишами русской, раскладка на время символа переключается и
+  после ввода возвращается исходная;
+* перевод строки (LF, CRLF, CR) — одно нажатие Enter, табуляция — Tab;
+* неразрывные и прочие «широкие» пробелы из веб-страниц печатаются обычным
+  пробелом, невидимые управляющие символы пропускаются;
+* включённый Caps Lock на время ввода выключается и затем восстанавливается;
+* символы, которых нет ни в одной раскладке (`✓`, `—`), набираются через
+  временно назначенную свободную клавишу; в веб-консоли ВМ они, как и раньше,
+  могут не появиться;
+* остановка отпускает нажатые клавиши и восстанавливает раскладку.
+
 ## Исправления 1.0.2
 
 Зарегистрированы GObject-классы индикатора и диалогов, исправлена связь
@@ -85,7 +105,8 @@ RPM устанавливает файлы системно, поэтому то�
 
 * РЕД ОС с GNOME Shell 44–48;
 * сеанс «GNOME on Xorg» для функции набора;
-* `python3`, `xdotool`, `glib-compile-schemas`, `gnome-extensions`;
+* `python3`, библиотеки `libX11` и `libXtst` (желательно `libxkbcommon`),
+  `glib-compile-schemas`, `gnome-extensions`;
 * запуск приложения обычным пользователем.
 
 Проверка до установки:
@@ -97,14 +118,14 @@ RPM устанавливает файлы системно, поэтому то�
 Если зависимостей нет, сначала найдите их в подключённых репозиториях:
 
 ```bash
-dnf info xdotool python3 glib2 gnome-shell
-sudo -E dnf install xdotool python3 glib2 gnome-shell
+dnf info libX11 libXtst libxkbcommon python3 glib2 gnome-shell
+sudo -E dnf install libX11 libXtst libxkbcommon python3 glib2 gnome-shell
 ```
 
 Названия пакетов следует подтвердить через `dnf info` именно на целевом
 компьютере. РЕД ОС официально использует DNF, но состав подключённых
 репозиториев может отличаться. Не подключайте репозитории другой ОС ради
-`xdotool`: это может нарушить совместимость системы. Документация:
+недостающих библиотек: это может нарушить совместимость системы. Документация:
 [управление RPM/DNF в РЕД ОС](https://redos.red-soft.ru/base/faq/faq-rpm-dnf/) и
 [источники программ](https://redos.red-soft.ru/base/redos-8_0/8_0-base-consept/8_0-sys-dnf/8_0-gen-info-dnf/8_0-dnf-repo/).
 
@@ -174,10 +195,11 @@ gsettings --schemadir "$HOME/.local/share/gnome-shell/extensions/clipboard-typer
 пользователя. В ней не более 20 непустых уникальных строк; повторное копирование
 поднимает строку наверх. Текст не пишется в журналы.
 
-Helper читает UTF-8 через stdin и вызывает `xdotool` массивом аргументов. Текст
-не становится shell-командой, не подставляется в командную строку, `eval` и
-`shell=True` не используются. При остановке helper завершает группу процесса
-`xdotool`.
+Helper читает UTF-8 через stdin и сам отправляет нажатия через libXtst, без
+внешних программ. Текст не становится shell-командой, не подставляется в
+командную строку, `eval`, `subprocess` и `shell=True` не используются. При
+остановке helper отпускает нажатые клавиши, возвращает раскладку, Caps Lock и
+временно назначенную клавишу.
 
 ## Удаление
 
@@ -199,14 +221,12 @@ journalctl --user -b --no-pager | grep -F 'clipboard-typer@local'
 Диагностика не читает и не выводит буфер. Типичные причины:
 
 * `XDG_SESSION_TYPE=wayland` — на экране входа выберите «GNOME on Xorg»;
-* отсутствует `xdotool` — установите пакет из доверенного репозитория РЕД ОС;
+* `FAIL libXtst.so.6` — установите `libXtst` из доверенного репозитория РЕД ОС;
 * значка нет после установки — перелогиньтесь и включите расширение;
 * неверные символы — проверьте активную XKB-раскладку и тест ниже.
 
-`xdotool` использует X11 XTEST. Его документация прямо предупреждает, что ввод
-в Wayland работает некорректно: [README xdotool](https://github.com/jordansissel/xdotool#wayland).
-Режим `type --file -`, задержка и очистка модификаторов основаны на
-[исходном коде команды type](https://github.com/jordansissel/xdotool/blob/main/cmd_type.c).
+Ввод использует расширение X11 XTEST, поэтому работает только в сеансе Xorg:
+в Wayland такие события не доходят до обычных приложений.
 
 ## Ручная проверка на целевом GNOME
 

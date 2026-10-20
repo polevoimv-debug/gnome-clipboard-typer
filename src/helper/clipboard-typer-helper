@@ -1,33 +1,448 @@
 #!/usr/bin/env python3
-"""Cancelable X11 keyboard typing helper. Clipboard text is never logged."""
+"""Cancelable X11 keyboard typing helper. Clipboard text is never logged.
+
+Text is typed with XTEST key events built from the active XKB keymap. Every
+character is sent with a physical key of the layout group that really contains
+it, and the group is locked for that key. ASCII prefers the Latin group, so web
+consoles of virtual machines, which forward scan codes, receive the same keys a
+US keyboard would send. Characters missing from every group are typed through a
+temporarily remapped spare keycode.
+"""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import os
 import signal
-import subprocess
 import sys
 import threading
-
+import unicodedata
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from typing import Protocol
 
 STOPPED = threading.Event()
-CHILD: subprocess.Popen[bytes] | None = None
+
+SHIFT_MASK = 1 << 0
+LOCK_MASK = 1 << 1
+GROUP_SHIFT = 13
+XKB_USE_CORE_KBD = 0x0100
+
+XK_TAB = 0xFF09
+XK_RETURN = 0xFF0D
+XK_SHIFT_L = 0xFFE1
+XK_CAPS_LOCK = 0xFFE5
+XK_ISO_LEVEL3_SHIFT = 0xFE03
+MODIFIER_KEYSYMS = frozenset([*range(0xFFE1, 0xFFEF), 0xFE03, 0xFE11, 0xFF7E])
+
+# evdev keycodes of the alphanumeric block, Tab, Return and Space. Keys outside
+# it (keypad, the extra <LSGT> key) are used only when nothing else fits.
+MAIN_KEYCODES = frozenset([
+    *range(10, 22), 23, *range(24, 36), 36, *range(38, 50), 51, *range(52, 62), 65,
+])
+
+# Legacy XKB Cyrillic keysyms 0x6a1..0x6ff, used by the "ru" and "ua" layouts.
+_CYRILLIC_6A1 = "ђѓёєѕіїјљњћќґўџ№ЂЃЁЄЅІЇЈЉЊЋЌҐЎЏ"
+_CYRILLIC_6C0 = "юабцдефгхийклмнопярстужвьызшэщчъ"
+CYRILLIC_KEYSYMS = {
+    **{0x6A1 + index: char for index, char in enumerate(_CYRILLIC_6A1)},
+    **{0x6C0 + index: char for index, char in enumerate(_CYRILLIC_6C0)},
+    **{0x6E0 + index: char.upper() for index, char in enumerate(_CYRILLIC_6C0)},
+}
+
+
+class TyperError(Exception):
+    """A user-facing failure; the message never contains clipboard text."""
+
+    def __init__(self, message: str, code: int) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def keysym_to_char(keysym: int) -> str | None:
+    """Return the character produced by a printable keysym."""
+    if 0x20 <= keysym <= 0x7E or 0xA0 <= keysym <= 0xFF:
+        return chr(keysym)
+    if 0x01000100 <= keysym <= 0x0110FFFF:
+        return chr(keysym - 0x01000000)
+    return CYRILLIC_KEYSYMS.get(keysym)
+
+
+def char_to_keysym(char: str) -> int:
+    """Return a keysym for a character that is absent from the keymap."""
+    code = ord(char)
+    if 0x20 <= code <= 0x7E or 0xA0 <= code <= 0xFF:
+        return code
+    return 0x01000000 + code
+
+
+@dataclass(frozen=True)
+class Stroke:
+    keycode: int
+    group: int
+    mods: int
+    # Every group in which the same key and modifiers give the same character.
+    groups: frozenset[int] = frozenset()
+
+
+@dataclass(frozen=True)
+class KeyboardState:
+    group: int
+    locked_group: int
+    locked_mods: int
+
+
+class Keyboard(Protocol):
+    def keycode_range(self) -> tuple[int, int]: ...
+    def keysym_at(self, keycode: int, group: int, level: int) -> int: ...
+    def lookup(self, keycode: int, state: int) -> int: ...
+    def keycode_for(self, keysym: int) -> int: ...
+    def modifiers_for(self, keysym: int) -> int: ...
+    def char_of(self, keysym: int) -> str | None: ...
+    def state(self) -> KeyboardState: ...
+    def pressed_keycodes(self) -> list[int]: ...
+    def key(self, keycode: int, press: bool) -> None: ...
+    def lock_group(self, group: int) -> None: ...
+    def set_keysym(self, keycode: int, keysym: int) -> None: ...
+    def sync(self) -> None: ...
+
+
+def _mod_cost(mods: int) -> int:
+    return (2 if mods & ~SHIFT_MASK else 0) + (1 if mods & SHIFT_MASK else 0)
+
+
+class KeyTable:
+    """Pick the best physical key for every character of a keymap."""
+
+    def __init__(self, entries: Iterable[tuple[str, int, int, int]], current_group: int) -> None:
+        items = list(entries)
+        latin = sorted({group for char, _keycode, group, mods in items if char == "a" and mods == 0})
+        self.current_group = current_group
+        if current_group in latin or not latin:
+            self.latin_group = current_group
+        else:
+            self.latin_group = latin[0]
+        best: dict[str, tuple[tuple[int, ...], tuple[int, int, int]]] = {}
+        for char, keycode, group, mods in items:
+            rank = self._rank(char, keycode, group, mods)
+            known = best.get(char)
+            if known is None or rank < known[0]:
+                best[char] = (rank, (keycode, group, mods))
+        same: dict[tuple[str, int, int], set[int]] = {}
+        for char, keycode, group, mods in items:
+            same.setdefault((char, keycode, mods), set()).add(group)
+        self._strokes = {
+            char: Stroke(keycode, group, mods, frozenset(same[(char, keycode, mods)]))
+            for char, (_rank, (keycode, group, mods)) in best.items()
+        }
+
+    def _rank(self, char: str, keycode: int, group: int, mods: int) -> tuple[int, ...]:
+        if char.isascii() and char.isprintable():
+            preferred = (self.latin_group, self.current_group)
+        else:
+            preferred = (self.current_group, self.latin_group)
+        group_rank = preferred.index(group) if group in preferred else 2 + group
+        return (group_rank, keycode not in MAIN_KEYCODES, _mod_cost(mods), keycode)
+
+    def stroke_for(self, char: str) -> Stroke | None:
+        return self._strokes.get(char)
+
+
+def normalize(text: str) -> Iterator[str]:
+    """Yield typeable characters: one newline per line break, plain spaces."""
+    for char in text.replace("\r\n", "\n").replace("\r", "\n"):
+        category = unicodedata.category(char)
+        if char in "\n\t":
+            yield char
+        elif category == "Zs":
+            # Non-breaking and other spaces copied from web pages.
+            yield " "
+        elif category in ("Zl", "Zp"):
+            yield "\n"
+        elif category not in ("Cc", "Cf", "Cs", "Cn"):
+            yield char
+
+
+def plan(text: str, table: KeyTable) -> Iterator[Stroke | int]:
+    """Yield a key stroke for every character, or a keysym that needs a remap."""
+    for char in normalize(text):
+        stroke = table.stroke_for(char)
+        if stroke is not None:
+            yield stroke
+        elif char not in "\n\t":
+            yield char_to_keysym(char)
+
+
+def read_keymap(keyboard: Keyboard, extra_mods: int, level3: tuple[int, int] | None) -> KeyTable:
+    """Read every (character, keycode, group, modifiers) of the active keymap."""
+    first, last = keyboard.keycode_range()
+    keycodes = range(first, last + 1)
+    groups = [group for group in range(4) if any(keyboard.keysym_at(code, group, 0) for code in keycodes)]
+    entries: list[tuple[str, int, int, int]] = []
+    for group in groups or [0]:
+        base = extra_mods | (group << GROUP_SHIFT)
+        mod_sets = [0, SHIFT_MASK]
+        if level3 is not None and keyboard.lookup(level3[0], base) == XK_ISO_LEVEL3_SHIFT:
+            mod_sets += [level3[1], level3[1] | SHIFT_MASK]
+        for keycode in keycodes:
+            for mods in mod_sets:
+                keysym = keyboard.lookup(keycode, base | mods)
+                if keysym == XK_RETURN:
+                    char: str | None = "\n"
+                elif keysym == XK_TAB:
+                    char = "\t"
+                elif not keysym or 0xFE00 <= keysym <= 0xFFFF:
+                    char = None
+                else:
+                    char = keyboard.char_of(keysym)
+                if char:
+                    entries.append((char, keycode, group, mods))
+    return KeyTable(entries, keyboard.state().group)
+
+
+class Typer:
+    """Type text and always restore the keyboard group, Caps Lock and mapping."""
+
+    def __init__(self, keyboard: Keyboard, key_delay_ms: int) -> None:
+        self.keyboard = keyboard
+        self.step = key_delay_ms / 2000
+        self.pressed: list[int] = []
+        self.skipped = 0
+        self.group = 0
+
+    def run(self, text: str) -> None:
+        kb = self.keyboard
+        for keycode in kb.pressed_keycodes():
+            if kb.keysym_at(keycode, 0, 0) in MODIFIER_KEYSYMS:
+                kb.key(keycode, False)
+        original = kb.state()
+        caps_keycode = kb.keycode_for(XK_CAPS_LOCK) if original.locked_mods & LOCK_MASK else 0
+        self.group = original.group
+        group_changed = False
+        scratch = 0
+        try:
+            if caps_keycode:
+                self._tap(caps_keycode)
+                if kb.state().locked_mods & LOCK_MASK:
+                    caps_keycode = 0
+            extra_mods = kb.state().locked_mods
+            shift = kb.keycode_for(XK_SHIFT_L)
+            level3_keycode = kb.keycode_for(XK_ISO_LEVEL3_SHIFT)
+            level3_mask = kb.modifiers_for(XK_ISO_LEVEL3_SHIFT) if level3_keycode else 0
+            level3 = (level3_keycode, level3_mask) if level3_mask else None
+            table = read_keymap(kb, extra_mods, level3)
+            spare = self._spare_keycode()
+            for item in plan(text, table):
+                if STOPPED.is_set():
+                    break
+                if isinstance(item, Stroke):
+                    modifiers = [shift] if item.mods & SHIFT_MASK and shift else []
+                    if level3 is not None and item.mods & level3[1]:
+                        modifiers.append(level3[0])
+                    if self.group not in item.groups:
+                        kb.lock_group(item.group)
+                        self.group = item.group
+                        group_changed = True
+                    self._tap(item.keycode, modifiers)
+                elif spare:
+                    # Clients read the new mapping lazily: give them time on both sides.
+                    kb.set_keysym(spare, item)
+                    scratch = spare
+                    pause = max(self.step, 0.02)
+                    if self._pause(pause):
+                        break
+                    self._tap(spare)
+                    self._pause(pause)
+                else:
+                    self.skipped += 1
+        finally:
+            for keycode in reversed(self.pressed):
+                kb.key(keycode, False)
+            self.pressed.clear()
+            if scratch:
+                kb.sync()
+                self._pause(max(self.step, 0.05))
+                kb.set_keysym(scratch, 0)
+            if group_changed:
+                kb.lock_group(original.locked_group)
+            if caps_keycode:
+                kb.key(caps_keycode, True)
+                kb.key(caps_keycode, False)
+            kb.sync()
+
+    def _tap(self, keycode: int, modifiers: list[int] | None = None) -> None:
+        for code in [*(modifiers or []), keycode]:
+            self.keyboard.key(code, True)
+            self.pressed.append(code)
+        if self._pause(self.step):
+            return
+        while self.pressed:
+            self.keyboard.key(self.pressed.pop(), False)
+        self._pause(self.step)
+
+    @staticmethod
+    def _pause(seconds: float) -> bool:
+        """Wait unless stopped; return True when a stop was requested."""
+        return STOPPED.wait(seconds) if seconds > 0 else STOPPED.is_set()
+
+    def _spare_keycode(self) -> int:
+        first, last = self.keyboard.keycode_range()
+        for keycode in range(last, first - 1, -1):
+            if not any(self.keyboard.keysym_at(keycode, g, level) for g in range(4) for level in (0, 1)):
+                return keycode
+        return 0
+
+
+class XkbStateRec(ctypes.Structure):
+    _fields_ = [
+        ("group", ctypes.c_ubyte),
+        ("locked_group", ctypes.c_ubyte),
+        ("base_group", ctypes.c_ushort),
+        ("latched_group", ctypes.c_ushort),
+        ("mods", ctypes.c_ubyte),
+        ("base_mods", ctypes.c_ubyte),
+        ("latched_mods", ctypes.c_ubyte),
+        ("locked_mods", ctypes.c_ubyte),
+        ("compat_state", ctypes.c_ubyte),
+        ("grab_mods", ctypes.c_ubyte),
+        ("compat_grab_mods", ctypes.c_ubyte),
+        ("lookup_mods", ctypes.c_ubyte),
+        ("compat_lookup_mods", ctypes.c_ubyte),
+        ("ptr_buttons", ctypes.c_ushort),
+    ]
+
+
+ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+
+def _x_error(_display: int | None, _event: int | None) -> int:
+    # The default Xlib handler exits the process and would leave keys pressed.
+    return 0
+
+
+_ignore_x_error = ERROR_HANDLER(_x_error)
+
+
+def _load(soname: str, name: str) -> ctypes.CDLL | None:
+    for candidate in (soname, ctypes.util.find_library(name)):
+        if candidate:
+            try:
+                return ctypes.CDLL(candidate)
+            except OSError:
+                continue
+    return None
+
+
+class XKeyboard:
+    """XKB and XTEST access through libX11 and libXtst."""
+
+    def __init__(self) -> None:
+        x11 = _load("libX11.so.6", "X11")
+        xtst = _load("libXtst.so.6", "Xtst")
+        if x11 is None or xtst is None:
+            raise TyperError("Не найдены библиотеки libX11 и libXtst. Установите пакеты libX11 и libXtst.", 4)
+        self._xkbcommon = _load("libxkbcommon.so.0", "xkbcommon")
+        void, uint, ulong, ubyte, cint = ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ubyte, ctypes.c_int
+        ints = ctypes.POINTER(cint)
+        x11.XOpenDisplay.argtypes, x11.XOpenDisplay.restype = [ctypes.c_char_p], void
+        x11.XCloseDisplay.argtypes = [void]
+        x11.XSetErrorHandler.argtypes, x11.XSetErrorHandler.restype = [ERROR_HANDLER], void
+        x11.XkbUseExtension.argtypes, x11.XkbUseExtension.restype = [void, ints, ints], cint
+        x11.XDisplayKeycodes.argtypes = [void, ints, ints]
+        x11.XkbKeycodeToKeysym.argtypes, x11.XkbKeycodeToKeysym.restype = [void, ubyte, cint, cint], ulong
+        x11.XkbLookupKeySym.argtypes = [void, ubyte, uint, ctypes.POINTER(uint), ctypes.POINTER(ulong)]
+        x11.XkbLookupKeySym.restype = cint
+        x11.XkbGetState.argtypes, x11.XkbGetState.restype = [void, uint, ctypes.POINTER(XkbStateRec)], cint
+        x11.XkbLockGroup.argtypes, x11.XkbLockGroup.restype = [void, uint, uint], cint
+        x11.XkbKeysymToModifiers.argtypes, x11.XkbKeysymToModifiers.restype = [void, ulong], uint
+        x11.XKeysymToKeycode.argtypes, x11.XKeysymToKeycode.restype = [void, ulong], ubyte
+        x11.XQueryKeymap.argtypes = [void, ctypes.POINTER(ubyte * 32)]
+        x11.XChangeKeyboardMapping.argtypes = [void, cint, cint, ctypes.POINTER(ulong), cint]
+        x11.XSync.argtypes = [void, cint]
+        x11.XFlush.argtypes = [void]
+        xtst.XTestQueryExtension.argtypes = [void, ints, ints, ints, ints]
+        xtst.XTestQueryExtension.restype = cint
+        xtst.XTestFakeKeyEvent.argtypes, xtst.XTestFakeKeyEvent.restype = [void, uint, cint, ulong], cint
+        if self._xkbcommon is not None:
+            self._xkbcommon.xkb_keysym_to_utf32.argtypes = [ctypes.c_uint32]
+            self._xkbcommon.xkb_keysym_to_utf32.restype = ctypes.c_uint32
+        self._x11, self._xtst = x11, xtst
+        x11.XSetErrorHandler(_ignore_x_error)
+        self._display = x11.XOpenDisplay(None)
+        if not self._display:
+            raise TyperError("Не удалось подключиться к X-серверу из DISPLAY.", 5)
+        a, b, c, d = cint(), cint(), cint(), cint()
+        if not x11.XkbUseExtension(self._display, ctypes.byref(a), ctypes.byref(b)):
+            raise TyperError("X-сервер не поддерживает расширение XKB.", 5)
+        if not xtst.XTestQueryExtension(self._display, *(ctypes.byref(v) for v in (a, b, c, d))):
+            raise TyperError("X-сервер не поддерживает расширение XTEST.", 5)
+
+    def close(self) -> None:
+        self._x11.XCloseDisplay(self._display)
+
+    def keycode_range(self) -> tuple[int, int]:
+        first, last = ctypes.c_int(), ctypes.c_int()
+        self._x11.XDisplayKeycodes(self._display, ctypes.byref(first), ctypes.byref(last))
+        return first.value, last.value
+
+    def keysym_at(self, keycode: int, group: int, level: int) -> int:
+        return int(self._x11.XkbKeycodeToKeysym(self._display, keycode, group, level))
+
+    def lookup(self, keycode: int, state: int) -> int:
+        mods, keysym = ctypes.c_uint(), ctypes.c_ulong()
+        if not self._x11.XkbLookupKeySym(self._display, keycode, state, ctypes.byref(mods), ctypes.byref(keysym)):
+            return 0
+        return keysym.value
+
+    def keycode_for(self, keysym: int) -> int:
+        return int(self._x11.XKeysymToKeycode(self._display, keysym))
+
+    def modifiers_for(self, keysym: int) -> int:
+        return int(self._x11.XkbKeysymToModifiers(self._display, keysym))
+
+    def char_of(self, keysym: int) -> str | None:
+        if self._xkbcommon is not None:
+            code = int(self._xkbcommon.xkb_keysym_to_utf32(keysym))
+            if code >= 0x20 and not 0xD800 <= code <= 0xDFFF and code <= 0x10FFFF:
+                return chr(code)
+        return keysym_to_char(keysym)
+
+    def state(self) -> KeyboardState:
+        record = XkbStateRec()
+        self._x11.XkbGetState(self._display, XKB_USE_CORE_KBD, ctypes.byref(record))
+        return KeyboardState(record.group, record.locked_group, record.locked_mods)
+
+    def pressed_keycodes(self) -> list[int]:
+        keys = (ctypes.c_ubyte * 32)()
+        self._x11.XQueryKeymap(self._display, ctypes.byref(keys))
+        return [index * 8 + bit for index, byte in enumerate(keys) for bit in range(8) if byte & (1 << bit)]
+
+    def key(self, keycode: int, press: bool) -> None:
+        self._xtst.XTestFakeKeyEvent(self._display, keycode, int(press), 0)
+        self._x11.XFlush(self._display)
+
+    def lock_group(self, group: int) -> None:
+        self._x11.XkbLockGroup(self._display, XKB_USE_CORE_KBD, group)
+        self._x11.XSync(self._display, 0)
+
+    def set_keysym(self, keycode: int, keysym: int) -> None:
+        keysyms = (ctypes.c_ulong * 2)(keysym, keysym)
+        self._x11.XChangeKeyboardMapping(self._display, keycode, 2, keysyms, 1)
+        self._x11.XSync(self._display, 0)
+
+    def sync(self) -> None:
+        self._x11.XSync(self._display, 0)
 
 
 def stop(_signum: int, _frame: object) -> None:
-    """Stop the active xdotool process group without exposing its input."""
+    """Request a stop; the typing loop releases keys and restores the keymap."""
     STOPPED.set()
-    child = CHILD
-    if child is not None and child.poll() is None:
-        try:
-            os.killpg(child.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ввод UTF-8 через xdotool")
+    parser = argparse.ArgumentParser(description="Ввод UTF-8 через X11 XTEST")
     parser.add_argument("--start-delay-ms", type=int, default=2000)
     parser.add_argument("--key-delay-ms", type=int, default=50)
     args = parser.parse_args()
@@ -39,13 +454,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    global CHILD
     args = parse_args()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
     if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
-        print("Набор недоступен: xdotool не поддерживает сеанс Wayland.", file=sys.stderr)
+        print("Набор недоступен: ввод через XTEST не поддерживает сеанс Wayland.", file=sys.stderr)
         return 3
     if not os.environ.get("DISPLAY"):
         print("Набор недоступен: переменная DISPLAY не задана.", file=sys.stderr)
@@ -53,47 +467,33 @@ def main() -> int:
 
     data = sys.stdin.buffer.read()
     try:
-        data.decode("utf-8", errors="strict")
+        text = data.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
         print("Получены некорректные данные UTF-8.", file=sys.stderr)
         return 2
 
-    if not data:
+    if not text:
         return 0
     if STOPPED.wait(args.start_delay_ms / 1000):
         return 130
 
-    command = [
-        "xdotool", "type", "--clearmodifiers",
-        "--delay", str(args.key_delay_ms), "--file", "-",
-    ]
     try:
-        CHILD = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-    except FileNotFoundError:
-        print("Не найден xdotool. Установите системный пакет xdotool.", file=sys.stderr)
-        return 4
-
+        keyboard = XKeyboard()
+    except TyperError as error:
+        print(error, file=sys.stderr)
+        return error.code
+    typer = Typer(keyboard, args.key_delay_ms)
     try:
-        _stdout, stderr = CHILD.communicate(input=data)
-    except BrokenPipeError:
-        stderr = CHILD.stderr.read() if CHILD.stderr else b""
-    code = CHILD.returncode
-    CHILD = None
+        typer.run(text)
+    finally:
+        keyboard.close()
     if STOPPED.is_set():
         return 130
-    if code != 0:
-        message = stderr.decode("utf-8", errors="replace").strip()
-        print(message or "xdotool завершился с ошибкой.", file=sys.stderr)
-        return code or 1
+    if typer.skipped:
+        print(f"Не напечатано символов: {typer.skipped} — их нет в раскладке и нет свободной клавиши.", file=sys.stderr)
+        return 6
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

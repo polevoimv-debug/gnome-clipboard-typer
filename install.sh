@@ -13,14 +13,18 @@ if [[ ${EUID} -eq 0 ]]; then
     die "Не запускайте установщик от root. Расширение устанавливается текущему пользователю."
 fi
 
-for command_name in gnome-shell gnome-extensions glib-compile-schemas python3 xdotool; do
+for command_name in gnome-shell gnome-extensions glib-compile-schemas python3; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         log "Не найдена команда: ${command_name}"
-        log "Для РЕД ОС обычно подходят пакеты: gnome-shell, glib2, python3, xdotool."
+        log "Для РЕД ОС обычно подходят пакеты: gnome-shell, glib2, python3, libX11, libXtst."
         log "Установите отсутствующее системным менеджером пакетов и повторите запуск."
         exit 2
     fi
 done
+if ! python3 -c 'import ctypes; ctypes.CDLL("libX11.so.6"); ctypes.CDLL("libXtst.so.6")' >/dev/null 2>&1; then
+    log "ВНИМАНИЕ: не найдены libX11 или libXtst, без них набор не заработает."
+    log "Для РЕД ОС: sudo -E dnf install libX11 libXtst"
+fi
 
 shell_version="$(gnome-shell --version 2>/dev/null || true)"
 if [[ "$shell_version" =~ ([0-9]+)(\.[0-9]+)? ]]; then

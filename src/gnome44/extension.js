@@ -288,7 +288,7 @@ class ClipboardTyperExtension {
             return;
         }
         if (!this.isX11()) {
-            Main.notifyError('Набор недоступен', 'Текущий сеанс не X11. Войдите в GNOME on Xorg; xdotool не поддерживает Wayland.');
+            Main.notifyError('Набор недоступен', 'Текущий сеанс не X11. Войдите в GNOME on Xorg; ввод через XTEST не работает в Wayland.');
             return;
         }
         this._indicator.menu.close();

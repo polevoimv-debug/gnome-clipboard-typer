@@ -18,8 +18,17 @@ printf 'Сеанс:   %s\n' "${XDG_SESSION_TYPE:-не определён}"
 printf 'DISPLAY: %s\n' "${DISPLAY:+задан}"
 printf 'Язык:    %s\n' "${LANG:-не задан}"
 printf '\nЗависимости (содержимое буфера не читается):\n'
-for command_name in gnome-shell gnome-extensions glib-compile-schemas python3 xdotool; do
+for command_name in gnome-shell gnome-extensions glib-compile-schemas python3; do
     check_command "$command_name"
+done
+for library in libX11.so.6 libXtst.so.6 libxkbcommon.so.0; do
+    if python3 -c "import ctypes, sys; ctypes.CDLL(sys.argv[1])" "$library" >/dev/null 2>&1; then
+        printf 'OK   %-24s\n' "$library"
+    elif [[ "$library" == libxkbcommon.so.0 ]]; then
+        printf 'WARN %-24s не найдена: символы вне латиницы и кириллицы могут не печататься\n' "$library"
+    else
+        printf 'FAIL %-24s не найдена\n' "$library"
+    fi
 done
 
 printf '\nРасширение:\n'
@@ -27,12 +36,19 @@ gnome-extensions info "$UUID" 2>&1 || printf '%s\n' "Не установлено
 
 if [[ "${XDG_SESSION_TYPE:-}" != "x11" ]]; then
     printf '\nВНИМАНИЕ: для набора необходимо выбрать «GNOME on Xorg» на экране входа.\n'
-elif command -v xdotool >/dev/null 2>&1; then
-    if xdotool getactivewindow >/dev/null 2>&1; then
-        printf '\nOK: xdotool видит активное X11-окно.\n'
-    else
-        printf '\nFAIL: xdotool не получил активное окно; проверьте DISPLAY и X11-сеанс.\n'
-    fi
+elif python3 - <<'PY' >/dev/null 2>&1
+import ctypes
+x11 = ctypes.CDLL("libX11.so.6")
+xtst = ctypes.CDLL("libXtst.so.6")
+x11.XOpenDisplay.restype = ctypes.c_void_p
+display = ctypes.c_void_p(x11.XOpenDisplay(None))
+values = [ctypes.c_int() for _ in range(4)]
+raise SystemExit(0 if display and xtst.XTestQueryExtension(display, *map(ctypes.byref, values)) else 1)
+PY
+then
+    printf '\nOK: X-сервер доступен, расширение XTEST включено.\n'
+else
+    printf '\nFAIL: нет доступа к X-серверу или XTEST; проверьте DISPLAY и X11-сеанс.\n'
 fi
 
 printf '\nОшибки расширения можно посмотреть без вывода содержимого истории:\n'
